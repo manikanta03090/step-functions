@@ -1,0 +1,2 @@
+order_id,customer_id,customer_name,email,product_id,quantity,unit_price,order_status,order_date,updated_at,coupon_code
+O1011,C010,Ajay Singh,ajay@example.com,P20,1,120.00,NEW,2026-11-07,2026-11-07 10:00:00,DIWALI10

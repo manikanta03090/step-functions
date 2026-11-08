@@ -1,0 +1,2 @@
+order_id,customer_id,customer_name,product_id,quantity,unit_price,order_status,order_date,updated_at
+O1012,C011,Neha Gupta,P21,1,60.00,NEW,2026-11-08,2026-11-08 10:00:00

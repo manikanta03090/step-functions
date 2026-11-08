@@ -1,0 +1,8 @@
+order_id,customer_id,customer_name,email,product_id,quantity,unit_price,order_status,order_date,updated_at
+O1003,C003,Meena Iyer,meena@example.com,P12,5,89.99,SHIPPED,2026-11-02,2026-11-06 09:00:00
+O1004,C001,Asha Rao,asha@example.com,P13,1,250.00,PAID,2026-11-02,2026-11-02 11:15:00
+O1001,C001,Asha Rao,asha@example.com,P10,2,499.00,CANCELLED,2026-11-01,2026-10-31 10:00:00
+O1009,C007,Sunil Varma,sunil@example.com,P17,4,45.00,NEW,2026-11-06,2026-11-06 10:10:00
+O1010,C008,Divya Menon,divya@example.com,P18,1,899.00,NEW,2026-11-06,2026-11-06 10:20:00
+O1010,C008,Divya Menon,divya@example.com,P18,2,899.00,PAID,2026-11-06,2026-11-06 11:20:00
+,C009,Missing Key,missing@example.com,P19,1,10.00,NEW,2026-11-06,2026-11-06 12:00:00

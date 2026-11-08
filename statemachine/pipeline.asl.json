@@ -1,0 +1,146 @@
+{
+  "Comment": "CSV ingestion: Glue load + dedup upsert, archive file, notify",
+  "StartAt": "MarkProcessing",
+  "States": {
+    "MarkProcessing": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${ControlTable}",
+        "Key": {"file_id": {"S.$": "$.file_id"}},
+        "UpdateExpression": "SET #s = :s, execution_arn = :e",
+        "ExpressionAttributeNames": {"#s": "status"},
+        "ExpressionAttributeValues": {
+          ":s": {"S": "PROCESSING"},
+          ":e": {"S.$": "$$.Execution.Id"}
+        }
+      },
+      "ResultPath": null,
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed"}],
+      "Next": "RunGlueJob"
+    },
+    "RunGlueJob": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "${GlueJobName}",
+        "Arguments": {
+          "--SOURCE_S3_PATH.$": "States.Format('s3://{}/{}', $.bucket, $.key)",
+          "--RUN_ID.$": "$$.Execution.Name",
+          "--REJECT_S3_PATH.$": "States.Format('s3://{}/rejected_rows/{}/', $.bucket, $$.Execution.Name)"
+        }
+      },
+      "ResultPath": null,
+      "Retry": [
+        {"ErrorEquals": ["Glue.ConcurrentRunsExceededException"], "IntervalSeconds": 60, "BackoffRate": 2, "MaxAttempts": 5},
+        {"ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 120, "BackoffRate": 2, "MaxAttempts": 1}
+      ],
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed"}],
+      "Next": "ArchiveCopy"
+    },
+    "ArchiveCopy": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:s3:copyObject",
+      "Parameters": {
+        "Bucket.$": "$.bucket",
+        "CopySource.$": "States.Format('{}/{}', $.bucket, $.key)",
+        "Key.$": "States.Format('processed/{}', $.filename)"
+      },
+      "ResultPath": null,
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed"}],
+      "Next": "ArchiveDelete"
+    },
+    "ArchiveDelete": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:s3:deleteObject",
+      "Parameters": {
+        "Bucket.$": "$.bucket",
+        "Key.$": "$.key"
+      },
+      "ResultPath": null,
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed"}],
+      "Next": "MarkSucceeded"
+    },
+    "MarkSucceeded": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${ControlTable}",
+        "Key": {"file_id": {"S.$": "$.file_id"}},
+        "UpdateExpression": "SET #s = :s, finished_at = :t",
+        "ExpressionAttributeNames": {"#s": "status"},
+        "ExpressionAttributeValues": {
+          ":s": {"S": "SUCCEEDED"},
+          ":t": {"S.$": "$$.State.EnteredTime"}
+        }
+      },
+      "ResultPath": null,
+      "Next": "NotifySuccess"
+    },
+    "NotifySuccess": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${AlertTopicArn}",
+        "Subject": "Pipeline SUCCEEDED",
+        "Message.$": "States.Format('File s3://{}/{} was loaded into PostgreSQL (duplicates upserted) and archived under processed/. Execution: {}', $.bucket, $.key, $$.Execution.Id)"
+      },
+      "End": true
+    },
+    "MarkFailed": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${ControlTable}",
+        "Key": {"file_id": {"S.$": "$.file_id"}},
+        "UpdateExpression": "SET #s = :s, error = :e",
+        "ExpressionAttributeNames": {"#s": "status"},
+        "ExpressionAttributeValues": {
+          ":s": {"S": "FAILED"},
+          ":e": {"S.$": "States.JsonToString($.error)"}
+        }
+      },
+      "ResultPath": null,
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.cleanup_error", "Next": "FailedCopy"}],
+      "Next": "FailedCopy"
+    },
+    "FailedCopy": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:s3:copyObject",
+      "Parameters": {
+        "Bucket.$": "$.bucket",
+        "CopySource.$": "States.Format('{}/{}', $.bucket, $.key)",
+        "Key.$": "States.Format('failed/{}', $.filename)"
+      },
+      "ResultPath": null,
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.cleanup_error", "Next": "NotifyFailure"}],
+      "Next": "FailedDelete"
+    },
+    "FailedDelete": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:s3:deleteObject",
+      "Parameters": {
+        "Bucket.$": "$.bucket",
+        "Key.$": "$.key"
+      },
+      "ResultPath": null,
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.cleanup_error", "Next": "NotifyFailure"}],
+      "Next": "NotifyFailure"
+    },
+    "NotifyFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${AlertTopicArn}",
+        "Subject": "Pipeline FAILED",
+        "Message.$": "States.Format('File s3://{}/{} FAILED and was moved to failed/. Error: {}. Execution: {}', $.bucket, $.key, States.JsonToString($.error), $$.Execution.Id)"
+      },
+      "Next": "FailExecution"
+    },
+    "FailExecution": {
+      "Type": "Fail",
+      "Error": "PipelineFailed",
+      "Cause": "See the failure alert email and the execution history for details"
+    }
+  }
+}

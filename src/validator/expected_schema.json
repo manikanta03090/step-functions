@@ -1,0 +1,14 @@
+{
+  "columns": [
+    "order_id",
+    "customer_id",
+    "customer_name",
+    "email",
+    "product_id",
+    "quantity",
+    "unit_price",
+    "order_status",
+    "order_date",
+    "updated_at"
+  ]
+}

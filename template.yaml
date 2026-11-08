@@ -1,0 +1,418 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  S3 CSV -> SNS -> SQS -> Lambda validator -> Step Functions -> Glue -> RDS PostgreSQL
+  (duplicate-free upserts, schema-drift email alerts)
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: csv-pipeline
+    AllowedPattern: "^[a-z0-9-]{3,20}$"
+    Description: Lowercase prefix used for resource names (and the S3 bucket name)
+  AlertEmail:
+    Type: String
+    Description: Email address that receives rejected-file, failure and success alerts
+  FilePattern:
+    Type: String
+    Default: '^incoming/orders_[A-Za-z0-9_.-]+\.csv$'
+    Description: Regex an uploaded object key must match to be accepted
+  DbInstanceClass:
+    Type: String
+    Default: db.t4g.micro
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    Timeout: 30
+    MemorySize: 256
+
+Resources:
+  # ---------------------------------------------------------------- Network
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.20.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - {Key: Name, Value: !Sub "${ProjectName}-vpc"}
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.20.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.20.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  RouteAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  RouteAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Gateway
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      RouteTableIds: [!Ref PrivateRouteTable]
+
+  SecretsManagerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Interface
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.secretsmanager"
+      SubnetIds: [!Ref PrivateSubnetA]
+      SecurityGroupIds: [!Ref GlueSecurityGroup]
+      PrivateDnsEnabled: true
+
+  GlueSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Glue job ENIs and interface endpoints
+      VpcId: !Ref Vpc
+
+  GlueSelfIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref GlueSecurityGroup
+      IpProtocol: tcp
+      FromPort: 0
+      ToPort: 65535
+      SourceSecurityGroupId: !Ref GlueSecurityGroup
+
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: PostgreSQL access from Glue only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref GlueSecurityGroup
+
+  # --------------------------------------------------------------- Database
+  DbSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: !Sub "${ProjectName} PostgreSQL credentials"
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "pgadmin"}'
+        GenerateStringKey: password
+        PasswordLength: 24
+        ExcludeCharacters: '"@/\'
+
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnets for the pipeline database
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete   # portfolio project: change to Snapshot for real data
+    Properties:
+      Engine: postgres
+      DBInstanceClass: !Ref DbInstanceClass
+      AllocatedStorage: "20"
+      StorageType: gp3
+      DBName: ordersdb
+      MasterUsername: !Sub "{{resolve:secretsmanager:${DbSecret}:SecretString:username}}"
+      MasterUserPassword: !Sub "{{resolve:secretsmanager:${DbSecret}:SecretString:password}}"
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups: [!Ref DbSecurityGroup]
+      PubliclyAccessible: false
+      StorageEncrypted: true
+      BackupRetentionPeriod: 1
+
+  DbSecretAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref DbSecret
+      TargetId: !Ref Database
+      TargetType: AWS::RDS::DBInstance
+
+  # ------------------------------------------------------- Messaging + S3
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-alerts"
+      Subscription:
+        - {Protocol: email, Endpoint: !Ref AlertEmail}
+
+  IngestTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-s3-events"
+
+  IngestTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref IngestTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: s3.amazonaws.com}
+            Action: sns:Publish
+            Resource: !Ref IngestTopic
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub "arn:aws:s3:::${ProjectName}-data-${AWS::AccountId}-${AWS::Region}"
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  IngestDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-ingest-dlq"
+      MessageRetentionPeriod: 1209600
+
+  IngestQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-ingest"
+      VisibilityTimeout: 180   # >= 6x the validator Lambda timeout
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt IngestDLQ.Arn
+        maxReceiveCount: 3
+
+  IngestQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref IngestQueue]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: sns.amazonaws.com}
+            Action: sqs:SendMessage
+            Resource: !GetAtt IngestQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref IngestTopic
+
+  IngestSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref IngestTopic
+      Protocol: sqs
+      Endpoint: !GetAtt IngestQueue.Arn
+      RawMessageDelivery: true
+
+  DlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Messages landed in the ingest DLQ - validator keeps failing
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - {Name: QueueName, Value: !GetAtt IngestDLQ.QueueName}
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  DataBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: IngestTopicPolicy
+    Properties:
+      BucketName: !Sub "${ProjectName}-data-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - {Id: expire-tmp, Status: Enabled, Prefix: tmp/, ExpirationInDays: 7}
+          - {Id: expire-processed, Status: Enabled, Prefix: processed/, ExpirationInDays: 90}
+      NotificationConfiguration:
+        TopicConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            Topic: !Ref IngestTopic
+            Filter:
+              S3Key:
+                Rules:
+                  - {Name: prefix, Value: incoming/}
+                  - {Name: suffix, Value: .csv}
+
+  # ---------------------------------------------------------- Control table
+  ControlTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}-file-control"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: file_id, AttributeType: S}
+      KeySchema:
+        - {AttributeName: file_id, KeyType: HASH}
+
+  # ------------------------------------------------------------------- Glue
+  GlueJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: glue.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: pipeline-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
+                Resource: !Sub "arn:aws:s3:::${ProjectName}-data-${AWS::AccountId}-${AWS::Region}/*"
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub "arn:aws:s3:::${ProjectName}-data-${AWS::AccountId}-${AWS::Region}"
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref DbSecret
+
+  GlueNetworkConnection:
+    Type: AWS::Glue::Connection
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      ConnectionInput:
+        Name: !Sub "${ProjectName}-vpc-connection"
+        ConnectionType: NETWORK
+        PhysicalConnectionRequirements:
+          SubnetId: !Ref PrivateSubnetA
+          SecurityGroupIdList: [!Ref GlueSecurityGroup]
+          AvailabilityZone: !Select [0, !GetAZs ""]
+
+  GlueJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "${ProjectName}-csv-to-postgres"
+      Role: !GetAtt GlueJobRole.Arn
+      GlueVersion: "4.0"
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      Timeout: 30
+      MaxRetries: 0
+      ExecutionProperty:
+        MaxConcurrentRuns: 3
+      Connections:
+        Connections: [!Ref GlueNetworkConnection]
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        # uploaded by deploy.sh after the stack is created
+        ScriptLocation: !Sub "s3://${ProjectName}-data-${AWS::AccountId}-${AWS::Region}/scripts/csv_to_postgres.py"
+      DefaultArguments:
+        "--job-language": python
+        "--enable-metrics": "true"
+        "--TempDir": !Sub "s3://${ProjectName}-data-${AWS::AccountId}-${AWS::Region}/tmp/"
+        "--DB_SECRET_ARN": !Ref DbSecret
+        "--TARGET_TABLE": orders
+
+  # --------------------------------------------------------- Step Functions
+  PipelineStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub "${ProjectName}-pipeline"
+      DefinitionUri: statemachine/pipeline.asl.json
+      DefinitionSubstitutions:
+        ControlTable: !Ref ControlTable
+        GlueJobName: !Ref GlueJob
+        AlertTopicArn: !Ref AlertTopic
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [glue:StartJobRun, glue:GetJobRun, glue:GetJobRuns, glue:BatchStopJobRun]
+              Resource: !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/${GlueJob}"
+            - Effect: Allow
+              Action: dynamodb:UpdateItem
+              Resource: !GetAtt ControlTable.Arn
+            - Effect: Allow
+              Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
+              Resource: !Sub "arn:aws:s3:::${ProjectName}-data-${AWS::AccountId}-${AWS::Region}/*"
+            - Effect: Allow
+              Action: sns:Publish
+              Resource: !Ref AlertTopic
+
+  # ------------------------------------------------------ Validator Lambda
+  ValidatorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-validator"
+      CodeUri: src/validator/
+      Handler: app.handler
+      Environment:
+        Variables:
+          CONTROL_TABLE: !Ref ControlTable
+          STATE_MACHINE_ARN: !Ref PipelineStateMachine
+          ALERT_TOPIC_ARN: !Ref AlertTopic
+          FILE_PATTERN: !Ref FilePattern
+          REJECTED_PREFIX: rejected/
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
+              Resource: !Sub "arn:aws:s3:::${ProjectName}-data-${AWS::AccountId}-${AWS::Region}/*"
+            - Effect: Allow
+              Action: [dynamodb:PutItem, dynamodb:UpdateItem]
+              Resource: !GetAtt ControlTable.Arn
+            - Effect: Allow
+              Action: states:StartExecution
+              Resource: !Ref PipelineStateMachine
+            - Effect: Allow
+              Action: sns:Publish
+              Resource: !Ref AlertTopic
+      Events:
+        FromQueue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt IngestQueue.Arn
+            BatchSize: 5
+            FunctionResponseTypes: [ReportBatchItemFailures]
+
+Outputs:
+  DataBucketName:
+    Value: !Sub "${ProjectName}-data-${AWS::AccountId}-${AWS::Region}"
+  StateMachineArn:
+    Value: !Ref PipelineStateMachine
+  GlueJobName:
+    Value: !Ref GlueJob
+  DbSecretArn:
+    Value: !Ref DbSecret
+  DbEndpoint:
+    Value: !GetAtt Database.Endpoint.Address
+  IngestDlqUrl:
+    Value: !Ref IngestDLQ
